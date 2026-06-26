@@ -1,0 +1,53 @@
+[project]
+name = "bbot-bee"
+version = "0.1.0"
+description = "BBOT Swarm Drone — agent that wraps BBOT to execute distributed scans"
+requires-python = ">=3.12"
+dependencies = [
+    "bbot-swarm-common",
+    "websockets>=15",
+    "pydantic>=2.12",
+    "pydantic-settings>=2.13",
+    "orjson>=3.11",
+    "bbot",
+]
+
+[project.scripts]
+bbot-bee = "bbot_bee.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.3",
+    "pytest-cov>=7",
+    "mypy>=1.19",
+    "ruff>=0.15",
+]
+
+[tool.uv.sources]
+bbot = { git = "https://github.com/blacklanternsecurity/bbot", rev = "7dd31c646c052a7c910dcc48bb7360333b376231" }
+bbot-swarm-common = { git = "ssh://git@github.com/blacklanternsecurity/bbot-swarm-common", rev = "dev" }
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "bbot.*"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 119
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "ANN", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
