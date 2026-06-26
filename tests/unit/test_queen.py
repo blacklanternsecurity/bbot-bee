@@ -1,9 +1,4 @@
-"""Tests for bbot_bee.queen — Queen class orchestrating drones and hive communication.
-
-Queen is the main agent process: connects to the hive via WebSocket,
-manages drone subprocesses, buffers events/logs, and reports state.
-Merges the responsibilities of the old Drone + ScanSupervisor classes.
-"""
+"""Tests for bbot_bee.queen."""
 
 from __future__ import annotations
 
@@ -16,7 +11,6 @@ from swarm_common.models import ScanStatus, StateSyncPayload
 from bbot_bee.config import BeeConfig
 from bbot_bee.queen import Queen
 
-# Mock subprocess script for fast scan lifecycle tests
 _MOCK_SUCCESS_SCRIPT = textwrap.dedent("""\
     import json, sys, time
     config = json.loads(sys.stdin.readline())
@@ -44,29 +38,23 @@ def _make_config(**overrides: object) -> BeeConfig:
         "log_level": "DEBUG",
     }
     defaults.update(overrides)
+    # type: ignore[arg-type] — defaults dict typed as object for flexibility, validated by pydantic
     return BeeConfig(**defaults)  # type: ignore[arg-type]
 
 
-# Dummy preset — mock scripts ignore it
 _MOCK_PRESET = {"target": ["127.0.0.1"], "modules": []}
 
 
-# ---------------------------------------------------------------------------
-# Init
-# ---------------------------------------------------------------------------
-
-
 class TestQueenCgroupGate:
-    """Queen refuses to boot if cgroup v2 / cgroup.kill is not available.
-
-    Mandatory by user requirement — no env flag override. The bee must
-    fail loudly rather than silently fall back to soft-guarantee mode.
-    """
+    """Queen refuses to boot if cgroup v2 / cgroup.kill is not available — no env flag override."""
 
     def test_init_raises_when_cgroup_unsupported(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """detect_cgroup_kill_supported() == False → Queen.__init__ raises."""
-        monkeypatch.setattr("bbot_bee.cgroup.detect_cgroup_kill_supported", lambda: False)
-        with pytest.raises(RuntimeError, match="cgroup"):
+        """detect_cgroup_kill_supported() returns (False, reason) → Queen.__init__ raises."""
+        monkeypatch.setattr(
+            "bbot_bee.cgroup.detect_cgroup_kill_supported",
+            lambda: (False, "ro_cgroupfs"),
+        )
+        with pytest.raises(RuntimeError, match="read-only"):
             Queen(_make_config())
 
     def test_init_recovers_orphan_cgroups(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -93,9 +81,9 @@ class TestQueenCgroupGate:
             lambda: calls.append("recover") or 0,
         )
         queen = Queen(_make_config())
+        # type: ignore[assignment] — replacing real ConnectionManager with AsyncMock for test
         queen._connection = AsyncMock()  # type: ignore[assignment]
         await queen.shutdown()
-        # Called once at init AND once at shutdown.
         assert calls.count("recover") == 2
 
 
@@ -115,11 +103,6 @@ class TestQueenInit:
         assert queen._event_buffer == {}
         assert queen._log_buffer == {}
         assert queen._drones == {}
-
-
-# ---------------------------------------------------------------------------
-# Drone management (capacity, start, stop)
-# ---------------------------------------------------------------------------
 
 
 class TestQueenStartScan:
@@ -196,11 +179,6 @@ class TestQueenCapacity:
         assert queen.available_capacity == 3
 
 
-# ---------------------------------------------------------------------------
-# Event buffering
-# ---------------------------------------------------------------------------
-
-
 class TestQueenEventBuffering:
     """Tests for event buffering and flushing."""
 
@@ -219,11 +197,6 @@ class TestQueenEventBuffering:
         assert len(queen._event_buffer["scan-2"]) == 1
 
 
-# ---------------------------------------------------------------------------
-# Log buffering
-# ---------------------------------------------------------------------------
-
-
 class TestQueenLogBuffering:
     """Tests for log line buffering."""
 
@@ -232,11 +205,6 @@ class TestQueenLogBuffering:
         queen = Queen(_make_config())
         await queen._handle_scan_log_line("scan-1", "some log message")
         assert queen._log_buffer["scan-1"][0] == "some log message"
-
-
-# ---------------------------------------------------------------------------
-# Status change handling
-# ---------------------------------------------------------------------------
 
 
 class TestQueenStatusChange:
@@ -253,7 +221,6 @@ class TestQueenStatusChange:
     async def test_terminal_status_auto_removes_drone(self) -> None:
         """A terminal status should auto-remove the drone from tracking."""
         queen = Queen(_make_config())
-        # Mock the channel so status sends don't fail (no real hive connection)
         queen._channel = AsyncMock()
         queen._channel.send = AsyncMock()
 
@@ -264,18 +231,11 @@ class TestQueenStatusChange:
         )
         assert "scan-auto" in queen._drones
 
-        # Wait for the fast mock scan to finish (auto-cleans)
         drone = queen._drones.get("scan-auto")
         if drone is not None:
             await drone.wait()
 
-        # The terminal status callback should have auto-removed it
         assert "scan-auto" not in queen._drones
-
-
-# ---------------------------------------------------------------------------
-# State sync
-# ---------------------------------------------------------------------------
 
 
 class TestQueenStateSync:
@@ -292,6 +252,17 @@ class TestQueenStateSync:
         assert payload.capacity["available"] == 3
         assert payload.active_scans == {}
 
+    def test_build_state_sync_includes_stable_boot_id(self) -> None:
+        """boot_id is a non-empty per-process value, identical across syncs but unique per Queen."""
+        queen = Queen(_make_config())
+        first = queen._build_state_sync().boot_id
+        second = queen._build_state_sync().boot_id
+        assert first
+        assert first == second  # stable within a process
+
+        other = Queen(_make_config()).boot_id
+        assert other != first  # fresh process → fresh boot_id
+
     async def test_set_max_scans_updates_limit_and_sends_state_sync(self) -> None:
         """set_max_scans command should update the runtime limit and emit state_sync."""
         queen = Queen(_make_config(max_init_concurrent_scans=3))
@@ -300,6 +271,7 @@ class TestQueenStateSync:
         async def _capture(msg: object, priority: object = None) -> None:
             sent.append(msg)
 
+        # type: ignore[method-assign] — replacing channel.send with capture for test
         queen._channel.send = _capture  # type: ignore[method-assign]
 
         await queen._handle_command({"cmd": "set_max_scans", "max_scans": 7})
@@ -309,11 +281,6 @@ class TestQueenStateSync:
         assert len(sent) == 1
         assert sent[0].payload["capacity"]["max_scans"] == 7
         assert sent[0].payload["capacity"]["init_max_scans"] == 3
-
-
-# ---------------------------------------------------------------------------
-# Shutdown
-# ---------------------------------------------------------------------------
 
 
 class TestQueenShutdown:

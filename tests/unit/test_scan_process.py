@@ -1,9 +1,4 @@
-"""Tests for bbot_bee.scan_process — subprocess entry point for isolated bbot scans.
-
-Runs scan_process.py as a real subprocess with controlled input.
-Verifies the stdout JSON line protocol, exit codes, and SIGTERM handling.
-These tests require bbot (they run a real Scanner in the subprocess).
-"""
+"""Tests for bbot_bee.scan_process."""
 
 from __future__ import annotations
 
@@ -15,7 +10,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Minimal preset that runs fast with no external deps
 _FAST_PRESET: dict[str, Any] = {
     "target": ["127.0.0.1"],
     "modules": [],
@@ -90,7 +84,6 @@ class TestScanProcessProtocol:
         status_lines = [msg for msg in lines if msg.get("_type") == "status"]
         assert len(status_lines) >= 2, f"Expected at least 2 status messages, got {len(status_lines)}"
 
-        # Each status message should have status and status_code
         for msg in status_lines:
             assert "status" in msg, f"Missing 'status' field in {msg}"
             assert "status_code" in msg, f"Missing 'status_code' field in {msg}"
@@ -108,7 +101,6 @@ class TestScanProcessProtocol:
 
         event_lines = [msg for msg in lines if msg.get("_type") == "event"]
         for event in event_lines:
-            # bbot events have a "type" field (e.g. DNS_NAME, SCAN)
             assert "type" in event, f"Missing bbot 'type' field in event: {event}"
 
     async def test_status_codes_advance_forward(self) -> None:
@@ -144,9 +136,8 @@ class TestScanProcessSigterm:
 
     async def test_sigterm_exits_with_code_2(self) -> None:
         """Sending SIGTERM during a scan should result in exit code 2 (aborted)."""
-        # Use a preset with a module that takes time so we can send SIGTERM
         slow_preset = dict(_FAST_PRESET)
-        slow_preset["modules"] = ["httpx"]
+        slow_preset["modules"] = ["http"]
         slow_preset["target"] = ["127.0.0.1"]
 
         payload = json.dumps({"scan_id": "test-sigterm", "preset": slow_preset}).encode()
@@ -164,7 +155,6 @@ class TestScanProcessSigterm:
         proc.stdin.write(payload)
         proc.stdin.close()
 
-        # Wait for the scan to start (look for STARTING or RUNNING status)
         assert proc.stdout is not None
         started = False
         for _ in range(100):
@@ -180,10 +170,8 @@ class TestScanProcessSigterm:
 
         assert started, "Scan never reached STARTING/RUNNING before timeout"
 
-        # Send SIGTERM
         os.kill(proc.pid, signal.SIGTERM)
 
-        # Wait for process to exit
         try:
             await asyncio.wait_for(proc.wait(), timeout=30.0)
         except TimeoutError:
@@ -245,24 +233,10 @@ class TestScanProcessStdin:
 
 
 class TestScanProcessCgroupSelfEnroll:
-    """Belt-and-suspenders for the spawn→populate race window in Drone.start().
-
-    The parent (Drone) writes the subprocess PID to ``cgroup.procs``
-    immediately after ``create_subprocess_exec`` returns. Between exec and
-    that write, the Python interpreter is starting up — under normal bbot
-    operation it cannot fork (it hasn't even read stdin), but a future
-    refactor could introduce an eager-import fork. Self-enroll on the
-    child side closes the window permanently.
-
-    The self-enroll runs at the very top of ``main()``, before any other
-    code path — even an empty / invalid stdin must still result in the
-    PID being written.
-    """
+    """Closes the spawn→populate race window in Drone.start() by enrolling on the child side at the top of main()."""
 
     async def test_self_enroll_writes_pid_when_env_set(self, tmp_path: Path) -> None:
-        """``BBOT_BEE_SCAN_CGROUP=<dir>`` → child writes its PID to
-        ``<dir>/cgroup.procs`` before exiting on bad stdin.
-        """
+        """``BBOT_BEE_SCAN_CGROUP=<dir>`` → child writes its PID to ``cgroup.procs`` before exiting on bad stdin."""
         procs_file = tmp_path / "cgroup.procs"
         procs_file.write_text("")
 
@@ -277,7 +251,8 @@ class TestScanProcessCgroupSelfEnroll:
             env=env,
         )
         assert proc.stdin is not None
-        proc.stdin.close()  # immediate EOF — scan_process will exit 1
+        # Immediate EOF — scan_process will exit 1, but only after self-enroll.
+        proc.stdin.close()
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=10.0)
@@ -289,10 +264,7 @@ class TestScanProcessCgroupSelfEnroll:
         assert written == str(proc.pid), f"expected self-enroll to write PID {proc.pid}, got {written!r}"
 
     async def test_no_env_no_action(self) -> None:
-        """Without the env var, scan_process must behave exactly as before —
-        the self-enroll is a no-op and the existing exit-on-empty-stdin
-        behavior is preserved.
-        """
+        """Without the env var, scan_process must behave exactly as before — self-enroll is a no-op."""
         env = {k: v for k, v in os.environ.items() if k != "BBOT_BEE_SCAN_CGROUP"}
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -312,14 +284,10 @@ class TestScanProcessCgroupSelfEnroll:
             proc.kill()
             await proc.wait()
 
-        # Must still exit non-zero on empty stdin — no regression.
         assert proc.returncode != 0
 
     async def test_self_enroll_failure_does_not_crash(self, tmp_path: Path) -> None:
-        """If the cgroup path is invalid / unwritable, the child must log
-        to stderr but continue — the parent's populate() is authoritative,
-        and a failed self-enroll on the child side must not crash the scan.
-        """
+        """If the cgroup path is invalid, the child logs to stderr but continues without crashing."""
         nonexistent = tmp_path / "does-not-exist"
         env = {**os.environ, "BBOT_BEE_SCAN_CGROUP": str(nonexistent)}
         proc = await asyncio.create_subprocess_exec(
@@ -340,6 +308,5 @@ class TestScanProcessCgroupSelfEnroll:
             proc.kill()
             _, stderr_data = await proc.communicate()
 
-        # The child still ran far enough to fail on empty stdin (not crash earlier).
         assert proc.returncode is not None
         assert b"BBOT_BEE_SCAN_CGROUP" in stderr_data or b"cgroup" in stderr_data.lower()

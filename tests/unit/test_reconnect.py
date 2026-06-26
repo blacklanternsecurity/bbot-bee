@@ -1,11 +1,4 @@
-"""Tests for the bee reconnect loop — inspired by chaos gauntlet Bug 1.
-
-Bug 1: Bee did not reconnect after hive WebSocket drop because
-asyncio.gather() never returned (flush loops ran forever).
-
-The fix uses an asyncio.Event (_disconnected) to signal the reconnect
-loop instead of waiting for all tasks to exit.
-"""
+"""Tests for the bee reconnect loop."""
 
 from __future__ import annotations
 
@@ -38,7 +31,6 @@ class TestReconnectLoop:
         """The disconnected_event is set when _mark_disconnected fires."""
         queen = Queen(_make_config())
         assert not queen._connection.disconnected_event.is_set()
-        # Simulate connection being established first, then disconnecting
         queen._connection._state = ConnectionState.CONNECTED
         await queen._connection._mark_disconnected()
         assert queen._connection.disconnected_event.is_set()
@@ -48,20 +40,15 @@ class TestReconnectLoop:
         queen = Queen(_make_config())
         queen._connection.disconnected_event.set()
 
-        # Patch connect to raise immediately so the loop iterates once
         with (
             patch.object(queen._connection, "connect", side_effect=ConnectionError("test")),
             patch.object(queen._connection, "disconnect", new_callable=AsyncMock),
         ):
-            # Run the loop for just enough time to see it clear and iterate
             task = asyncio.create_task(queen.run())
             await asyncio.sleep(0.2)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-
-        # After cancel, the event should have been cleared at least once
-        # (the loop clears it at the top of each iteration)
 
     async def test_reconnect_resets_backoff_on_success(self) -> None:
         """Backoff resets to 1.0 after a successful connection."""
@@ -74,7 +61,6 @@ class TestReconnectLoop:
             connect_count += 1
             if connect_count == 1:
                 raise ConnectionError("first attempt fails")
-            # Second attempt succeeds, then we trigger disconnect
             queen._connection.disconnected_event.set()
 
         with (
@@ -82,7 +68,8 @@ class TestReconnectLoop:
             patch.object(queen._connection, "disconnect", new_callable=AsyncMock),
         ):
             task = asyncio.create_task(queen.run())
-            await asyncio.sleep(2.5)  # enough for 1 fail + backoff + 1 success
+            # Allow time for 1 fail + backoff + 1 success.
+            await asyncio.sleep(2.5)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -94,7 +81,7 @@ class TestReconnectLoop:
         queen = Queen(_make_config())
 
         async def mock_connect() -> None:
-            queen._connection.disconnected_event.set()  # immediately disconnect
+            queen._connection.disconnected_event.set()
 
         with (
             patch.object(queen._connection, "connect", side_effect=mock_connect),
@@ -106,5 +93,4 @@ class TestReconnectLoop:
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-        # After cancel, _tasks should be empty (cleared after cancellation)
         assert queen._tasks == []

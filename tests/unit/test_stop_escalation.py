@@ -1,22 +1,4 @@
-"""Tests for Drone.stop() SIGKILL escalation robustness.
-
-These regressions pin the contract that the graceful-stop escalation
-(SIGTERM → wait → SIGKILL) is decoupled from the calling coroutine's
-cancellation. Without this decoupling, any external ``task.cancel()``
-on whatever coroutine is awaiting ``drone.stop()`` also cancels the
-SIGKILL-escalation branch — leaving a stuck SIGTERM-ignoring subprocess
-running forever.
-
-The bug was hit in production when the bee's WebSocket heartbeat timed
-out mid-stop (hive was saturated draining a 10-minute scan's event
-backlog), triggering a reconnect that cancelled ``_message_loop``,
-which cascaded into cancelling the in-flight ``drone.stop()``, which
-cancelled its ``await _await_exit`` — bypassing the ``except
-TimeoutError`` branch that would have fired SIGKILL.
-
-The fix: schedule SIGKILL via ``loop.call_later`` so it runs as a
-synchronous event-loop callback immune to coroutine cancellation.
-"""
+"""Tests for Drone.stop() SIGKILL escalation robustness."""
 
 from __future__ import annotations
 
@@ -29,8 +11,6 @@ from swarm_common.models import ScanStatus
 
 from bbot_bee.drone import Drone
 
-# Subprocess that installs SIGTERM → SIG_IGN and then spins forever.
-# SIGKILL is the only way out.
 _IGNORE_SIGTERM = textwrap.dedent("""\
     import json, signal, sys, time
     config = json.loads(sys.stdin.readline())
@@ -41,7 +21,6 @@ _IGNORE_SIGTERM = textwrap.dedent("""\
         time.sleep(0.1)
 """)
 
-# Subprocess that exits cleanly on SIGTERM with code 2 (ABORTED).
 _HONOR_SIGTERM = textwrap.dedent("""\
     import json, signal, sys, time
     config = json.loads(sys.stdin.readline())
@@ -81,29 +60,18 @@ class TestStopEscalationRobustness:
     """The SIGKILL failsafe must fire regardless of caller cancellation."""
 
     async def test_sigkill_fires_when_subprocess_ignores_sigterm(self) -> None:
-        """Subprocess with SIGTERM handler = SIG_IGN must still be killed.
-
-        Validates the baseline escalation path: the test fixture is designed
-        such that nothing except SIGKILL will stop the subprocess.
-        """
+        """Subprocess with SIGTERM handler = SIG_IGN must still be killed."""
         drone = await _make_drone(_IGNORE_SIGTERM, graceful_timeout=0.5)
         assert drone._process is not None
 
         await drone.stop(force=False)
 
         assert drone._process.returncode is not None, "subprocess still running"
-        # Python's subprocess reports SIGKILL-terminated processes with
-        # returncode = -9 (negative of the signal number).
+        # subprocess reports SIGKILL-terminated processes as returncode -9.
         assert drone._process.returncode == -9, f"expected SIGKILL (-9), got {drone._process.returncode}"
 
     async def test_sigkill_fires_even_when_caller_cancelled(self) -> None:
-        """The core regression.
-
-        Cancelling the task that is awaiting ``drone.stop()`` must NOT
-        prevent the scheduled SIGKILL from firing. Pre-fix, the cancel
-        cascaded into ``_await_exit`` and bypassed the ``except
-        TimeoutError`` escalation branch.
-        """
+        """Cancelling the task awaiting drone.stop() must not prevent the scheduled SIGKILL from firing."""
         drone = await _make_drone(_IGNORE_SIGTERM, graceful_timeout=1.0)
         assert drone._process is not None
 
@@ -114,9 +82,8 @@ class TestStopEscalationRobustness:
         with pytest.raises(asyncio.CancelledError):
             await stop_task
 
-        # Despite the cancellation, the scheduled SIGKILL must fire and
-        # kill the subprocess within graceful_timeout + slack.
-        for _ in range(40):  # 4s total
+        # Allow graceful_timeout + slack for the scheduled SIGKILL to fire.
+        for _ in range(40):
             if drone._process.returncode is not None:
                 break
             await asyncio.sleep(0.1)
@@ -126,35 +93,23 @@ class TestStopEscalationRobustness:
         )
 
     async def test_cooperative_exit_cancels_failsafe_timer(self) -> None:
-        """When SIGTERM works, SIGKILL must NOT fire.
-
-        The escalation timer is set unconditionally when SIGTERM goes out;
-        if the subprocess exits cooperatively, the timer handle has to be
-        cancelled so no redundant SIGKILL is sent.
-        """
+        """When SIGTERM works, the failsafe SIGKILL timer must be cancelled so no redundant SIGKILL is sent."""
         drone = await _make_drone(_HONOR_SIGTERM, graceful_timeout=5.0)
         assert drone._process is not None
 
         await drone.stop(force=False)
 
         rc = drone._process.returncode
-        # Must NOT be -9 (SIGKILL). Accept either clean exit(2) or
-        # SIGTERM-terminated (-15) depending on the subprocess's handler.
+        # Accept clean exit(2) or SIGTERM-terminated (-15); must not be -9 (SIGKILL).
         assert rc != -9, f"SIGKILL fired unexpectedly (returncode={rc})"
         assert rc is not None, "subprocess still running"
 
     async def test_aborted_status_wins_after_escalation(self) -> None:
-        """After the failsafe SIGKILL lands, status must be ABORTED.
-
-        _monitor_process will observe a non-zero SIGKILL returncode and
-        attempt to set FAILED; the failsafe's explicit _set_status(ABORTED)
-        must win via forward-only comparison (ABORTED=8 > FAILED=7).
-        """
+        """After failsafe SIGKILL lands, ABORTED (8) must win over FAILED (7) via forward-only comparison."""
         drone = await _make_drone(_IGNORE_SIGTERM, graceful_timeout=0.5)
 
         await drone.stop(force=False)
-        # _set_status(ABORTED) is dispatched as a task from the timer
-        # callback; allow a moment for it to run after stop() returns.
+        # _set_status(ABORTED) is dispatched as a task from the timer callback.
         for _ in range(20):
             if drone.status == ScanStatus.ABORTED:
                 break

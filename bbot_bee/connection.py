@@ -1,13 +1,4 @@
-"""Layer 1: ConnectionManager (client mode).
-
-Thin subclass of swarm_common.resilient_websocket.ResilientWebSocket
-specialized for bee→hive connections:
-- Constructs auth headers from API key
-- Configures AppLevelHeartbeat with bee-ping/hive-pong payloads
-
-The heavy lifting (connect, disconnect, send_raw, recv_raw, heartbeat,
-backoff, disconnect detection) lives in ResilientWebSocket.
-"""
+"""Layer 1 WebSocket client (bee->hive) — thin subclass of `ResilientWebSocket`."""
 
 from __future__ import annotations
 
@@ -21,7 +12,6 @@ from swarm_common.resilient_websocket import (
 )
 
 log = getLogger(__name__)
-
 __all__ = ["ConnectionManager", "ConnectionState"]
 
 # Application-level ping/pong payloads (must match hive's bee_ws.py)
@@ -30,11 +20,10 @@ _PONG_PAYLOAD = b"hive-pong"
 
 
 class ConnectionManager(ResilientWebSocket):
-    """Layer 1: WebSocket client connecting to the hive.
+    """Layer 1 WebSocket client connecting to the hive.
 
-    Subclass of ResilientWebSocket with bee-specific defaults:
-    - Bearer token auth from API key
-    - App-level heartbeat with bee-ping/hive-pong
+    `ResilientWebSocket` with bee-specific defaults: Bearer token auth from API
+    key, app-level heartbeat with bee-ping/hive-pong.
     """
 
     def __init__(
@@ -52,15 +41,15 @@ class ConnectionManager(ResilientWebSocket):
 
         Args:
             url: WebSocket URL of the hive endpoint the bee should connect to.
-            api_key: Bee API key, sent as a ``Bearer`` token in the handshake.
-            heartbeat_interval_s: Seconds between app-level ``bee-ping`` frames.
-            heartbeat_timeout_s: Seconds to wait for a matching ``hive-pong``
+            api_key: Bee API key, sent as a `Bearer` token in the handshake.
+            heartbeat_interval_s: Seconds between app-level `bee-ping` frames.
+            heartbeat_timeout_s: Seconds to wait for a matching `hive-pong`
                 before declaring the connection dead.
             backoff_base_s: Initial reconnect delay.
             backoff_max_s: Maximum reconnect delay.
             backoff_jitter_factor: Random jitter applied to each reconnect delay,
                 expressed as a fraction of the current delay.
-            tls_verify: If False, skip TLS certificate verification (dev only).
+            tls_verify: If False, skip TLS certificate verification.
         """
         heartbeat = AppLevelHeartbeat(
             ping_payload=_PING_PAYLOAD,
@@ -69,16 +58,19 @@ class ConnectionManager(ResilientWebSocket):
             timeout_s=heartbeat_timeout_s,
         )
 
-        # Build an SSLContext only when verification is being disabled.
-        # When tls_verify=True we leave ssl_context=None so that websockets
-        # constructs its own default context (with verification enabled)
-        # for wss:// URLs.
+        # websockets rejects an `ssl` arg on ws:// URIs, so build the no-verify context only for wss://.
         ssl_context: SSLContext | None = None
         if not tls_verify:
-            ssl_context = SSLContext(PROTOCOL_TLS_CLIENT)
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = CERT_NONE
-            log.warning(f"ConnectionManager: TLS certificate verification is DISABLED for {url} (dev only)")
+            if url.lower().startswith("wss://"):
+                ssl_context = SSLContext(PROTOCOL_TLS_CLIENT)
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = CERT_NONE
+                log.warning(f"ConnectionManager: TLS certificate verification is DISABLED for {url}")
+            else:
+                log.warning(
+                    f"ConnectionManager: tls_verify=False ignored for non-TLS URL {url} "
+                    f"(ws:// has no certificate)"
+                )
 
         super().__init__(
             url=url,

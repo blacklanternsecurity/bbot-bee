@@ -1,8 +1,4 @@
-"""Tests for bbot_bee.connection — Layer 1: ConnectionManager (client mode).
-
-The client-mode ConnectionManager is a thin subclass of ResilientWebSocket
-that configures bee-specific auth headers and AppLevelHeartbeat.
-"""
+"""Tests for bbot_bee.connection."""
 
 from ssl import CERT_NONE, SSLContext
 from unittest.mock import AsyncMock, patch
@@ -61,25 +57,15 @@ class TestConnectionManagerInit:
 
 
 class TestConnectionManagerTlsVerify:
-    """Regression tests for the tls_verify flag.
-
-    Prior to the fix, ConnectionManager accepted `tls_verify=False` but
-    never passed it to ResilientWebSocket — the flag was silently ignored,
-    so certificates were always verified regardless. These tests pin the
-    flag's actual effect on the underlying SSLContext.
-    """
+    """Tests for the tls_verify flag's effect on the underlying SSLContext."""
 
     def test_default_leaves_ssl_context_none(self) -> None:
-        """tls_verify=True (default) must leave ssl_context unset so that
-        websockets builds its own default verifying context for wss://.
-        """
+        """tls_verify=True (default) must leave ssl_context unset so websockets builds its own verifying context for wss://."""
         mgr = ConnectionManager(url="wss://hive.example.com/ws", api_key="k")
         assert mgr._ssl_context is None
 
     def test_tls_verify_false_builds_permissive_context(self) -> None:
-        """tls_verify=False must produce an SSLContext with verification
-        fully disabled.
-        """
+        """tls_verify=False must produce an SSLContext with verification fully disabled."""
         mgr = ConnectionManager(
             url="wss://hive.example.com/ws",
             api_key="k",
@@ -99,9 +85,7 @@ class TestConnectionManagerTlsVerify:
         assert mgr._ssl_context is None
 
     def test_tls_verify_false_warns(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Disabling TLS verification must emit a WARNING so it's visible
-        in ops logs.
-        """
+        """Disabling TLS verification must emit a WARNING so it's visible in ops logs."""
         with caplog.at_level("WARNING", logger="bbot_bee.connection"):
             ConnectionManager(
                 url="wss://hive.example.com/ws",
@@ -110,6 +94,20 @@ class TestConnectionManagerTlsVerify:
             )
         assert any("TLS certificate verification is DISABLED" in rec.message for rec in caplog.records), (
             "expected a WARNING about disabled TLS verification"
+        )
+
+    def test_tls_verify_false_on_ws_url_leaves_ssl_context_none(self) -> None:
+        """tls_verify=False on a ws:// URL is a no-op: a plaintext link has no certificate to verify,
+        and websockets rejects an ssl argument on a ws:// URI."""
+        mgr = ConnectionManager(url="ws://hive.internal:8000/ws", api_key="k", tls_verify=False)
+        assert mgr._ssl_context is None
+
+    def test_tls_verify_false_on_ws_url_warns_noop(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A no-op --no-tls-verify on a ws:// URL should warn so operators see it had no effect."""
+        with caplog.at_level("WARNING", logger="bbot_bee.connection"):
+            ConnectionManager(url="ws://hive.internal:8000/ws", api_key="k", tls_verify=False)
+        assert any("non-TLS" in rec.message and "ignored" in rec.message for rec in caplog.records), (
+            "expected a WARNING that tls_verify=False was ignored on a non-TLS URL"
         )
 
 
@@ -154,6 +152,24 @@ class TestConnectionManagerConnect:
         call_kwargs = mock_connect.call_args
         headers = call_kwargs.kwargs.get("additional_headers", {})
         assert headers.get("Authorization") == "Bearer my-secret"
+
+    async def test_connect_ws_url_no_tls_verify_omits_ssl_kwarg(self) -> None:
+        """On ws:// with tls_verify=False, connect() must NOT pass an ssl kwarg —
+        websockets raises ValueError if ssl is supplied for a ws:// URI."""
+        mgr = ConnectionManager(url="ws://localhost/ws", api_key="key", tls_verify=False)
+        mock_connect = AsyncMock(return_value=AsyncMock())
+        with patch(_WS_CONNECT, mock_connect):
+            await mgr.connect()
+        assert "ssl" not in mock_connect.call_args.kwargs
+
+    async def test_connect_wss_url_no_tls_verify_passes_ssl_context(self) -> None:
+        """On wss:// with tls_verify=False, connect() MUST pass the permissive SSLContext,
+        else websockets falls back to its default verifying context."""
+        mgr = ConnectionManager(url="wss://localhost/ws", api_key="key", tls_verify=False)
+        mock_connect = AsyncMock(return_value=AsyncMock())
+        with patch(_WS_CONNECT, mock_connect):
+            await mgr.connect()
+        assert isinstance(mock_connect.call_args.kwargs.get("ssl"), SSLContext)
 
 
 class TestConnectionManagerSendRecv:

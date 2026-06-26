@@ -1,39 +1,25 @@
-"""Tests for bbot_bee.cgroup — per-scan cgroup v2 isolation.
-
-Replaces the brittle ``/proc/1/task/1/children`` sweep (see
-``BUG_REPORT_kill_orphaned_children.md``, 2026-04-16, which SIGKILLed the
-user's ``systemd --user`` on the host) with kernel-authoritative termination
-via ``cgroup.kill``. Each scan lives in
-``/sys/fs/cgroup/bbot-scans/scan_<scan_id>``; writing ``1`` to
-``<cgroup>/cgroup.kill`` atomically SIGKILLs every process in the cgroup,
-including grandchildren that escaped the process group, processes ignoring
-signals, and processes being forked into the cgroup.
-
-Tests use real ``tmp_path`` directories for happy paths and ``monkeypatch``
-for failure injection (EROFS / EBUSY / ENOENT). The kernel's
-auto-population of ``cgroup.procs`` / ``cgroup.kill`` inside a freshly
-created cgroup is simulated by wrapping ``Path.mkdir``.
-"""
+"""Tests for bbot_bee.cgroup — per-scan cgroup v2 isolation."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from errno import EBUSY, EROFS
+from os import ST_RDONLY, fspath, statvfs
 from pathlib import Path
 
 import pytest
 
 from bbot_bee import cgroup as cgroup_module
 from bbot_bee.cgroup import (
+    DETECT_REASON_KERNEL_TOO_OLD,
+    DETECT_REASON_NO_DELEGATION,
+    DETECT_REASON_NOT_CGROUP_V2,
+    DETECT_REASON_RO_CGROUPFS,
     ScanCgroup,
     detect_cgroup_kill_supported,
     reap_zombies,
     recover_orphan_cgroups,
 )
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _install_fake_cgroup_root(
@@ -44,10 +30,17 @@ def _install_fake_cgroup_root(
 ) -> Path:
     """Point the cgroup module at ``root`` and simulate kernel behavior on mkdir.
 
-    In a real cgroup v2 tree, the kernel automatically creates ``cgroup.procs``,
+    In a real cgroup v2 tree the kernel auto-creates ``cgroup.procs``,
     ``cgroup.events``, and (on Linux 5.14+) ``cgroup.kill`` inside every
-    freshly-made cgroup directory. We replicate that here so the tests touch
-    real directories on ``tmp_path`` rather than mocking every Path call.
+    freshly-made cgroup directory.
+
+    Args:
+        monkeypatch: pytest fixture used to patch module-level cgroup paths.
+        root: Temporary directory to use as the cgroup mount root.
+        kernel_kill: If True, simulate Linux 5.14+ by auto-creating ``cgroup.kill``.
+
+    Returns:
+        The simulated parent cgroup directory (``root / "bbot-scans"``).
     """
     parent = root / "bbot-scans"
     monkeypatch.setattr(cgroup_module, "_CGROUP_MOUNT", root)
@@ -78,11 +71,7 @@ def _install_fake_cgroup_root(
                     kill.write_text("0")
 
     def kernel_rmdir(self: Path) -> None:
-        """In a real cgroup tree, ``cgroup.procs``/``cgroup.kill``/etc. are
-        virtual interface files — they don't block rmdir. Simulate that
-        by clearing them before delegating to real rmdir, but only if
-        no child *cgroups* (subdirectories) are present.
-        """
+        """Virtual interface files don't block rmdir in a real cgroup tree — simulate that."""
         if str(self).startswith(str(root)) and self.is_dir():
             has_subdir = any(p.is_dir() for p in self.iterdir())
             if not has_subdir:
@@ -94,16 +83,33 @@ def _install_fake_cgroup_root(
 
     monkeypatch.setattr(Path, "mkdir", kernel_mkdir)
     monkeypatch.setattr(Path, "rmdir", kernel_rmdir)
-    # Top-level cgroup.controllers — only the unified v2 hierarchy has this.
+    # cgroup.controllers exists only at the root of a unified v2 hierarchy.
     (root / "cgroup.controllers").write_text("cpu memory pids\n")
     return parent
 
 
-def _drain_procs_after(path: Path, *, after_calls: int) -> Callable[[], None]:
-    """Returns a callable that, on the Nth invocation, empties ``cgroup.procs``.
+def _set_populated(path: Path, *, value: int) -> None:
+    """Write a ``cgroup.events`` file with the given populated value.
 
-    Used to test ``wait_empty`` — simulates the kernel reaping killed processes
-    out of the cgroup after some number of poll iterations.
+    Args:
+        path: Cgroup directory to update.
+        value: ``populated`` field value (0 = empty, 1 = has processes).
+    """
+    (path / "cgroup.events").write_text(f"populated {value}\nfrozen 0\n")
+
+
+def _drain_procs_after(path: Path, *, after_calls: int) -> Callable[[], None]:
+    """Return a callable that empties the cgroup on the Nth invocation.
+
+    Simulates the kernel reaping killed processes out of the cgroup after N
+    poll iterations, clearing both ``cgroup.procs`` and ``cgroup.events.populated``.
+
+    Args:
+        path: Cgroup directory whose files will be cleared.
+        after_calls: Number of invocations before the drain triggers.
+
+    Returns:
+        A no-arg callable suitable for patching ``reap_zombies``.
     """
     calls = {"n": 0}
 
@@ -111,22 +117,13 @@ def _drain_procs_after(path: Path, *, after_calls: int) -> Callable[[], None]:
         calls["n"] += 1
         if calls["n"] >= after_calls:
             (path / "cgroup.procs").write_text("")
+            _set_populated(path, value=0)
 
     return reaper
 
 
-# ---------------------------------------------------------------------------
-# detect_cgroup_kill_supported
-# ---------------------------------------------------------------------------
-
-
 class TestDetect:
-    """Startup probe for cgroup v2 + cgroup.kill availability.
-
-    Bee refuses to boot if this returns False — no override. Tests pin the
-    detection logic so a regression cannot let the bee silently start in
-    a degraded mode.
-    """
+    """Startup probe: pins detection logic so regressions cannot let the bee start in a degraded mode."""
 
     def test_returns_true_when_v2_and_cgroup_kill_present(
         self,
@@ -135,9 +132,9 @@ class TestDetect:
     ) -> None:
         """Happy path: writable v2 tree with cgroup.kill (kernel 5.14+)."""
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
-        assert detect_cgroup_kill_supported() is True
+        assert detect_cgroup_kill_supported() == (True, None)
 
-    def test_returns_false_when_cgroup_controllers_missing(
+    def test_returns_not_cgroup_v2_when_controllers_missing(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -145,23 +142,42 @@ class TestDetect:
         """cgroup v1 host has no /sys/fs/cgroup/cgroup.controllers."""
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
         (tmp_path / "cgroup.controllers").unlink()
-        assert detect_cgroup_kill_supported() is False
+        assert detect_cgroup_kill_supported() == (False, DETECT_REASON_NOT_CGROUP_V2)
 
-    def test_returns_false_when_cgroup_kill_missing(
+    def test_returns_ro_cgroupfs_when_statvfs_reports_rdonly(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ST_RDONLY check triggers the RO_CGROUPFS reason before any mkdir is attempted."""
+        _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
+
+        class FakeStatvfs:
+            f_flag = ST_RDONLY
+
+        def fake_statvfs(path: str | Path) -> object:
+            if Path(fspath(path)) == tmp_path:
+                return FakeStatvfs()
+            return statvfs(path)
+
+        monkeypatch.setattr("bbot_bee.cgroup.statvfs", fake_statvfs)
+        assert detect_cgroup_kill_supported() == (False, DETECT_REASON_RO_CGROUPFS)
+
+    def test_returns_kernel_too_old_when_cgroup_kill_missing(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Kernel <5.14 doesn't auto-create cgroup.kill on mkdir."""
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=False)
-        assert detect_cgroup_kill_supported() is False
+        assert detect_cgroup_kill_supported() == (False, DETECT_REASON_KERNEL_TOO_OLD)
 
-    def test_returns_false_when_mkdir_fails_erofs(
+    def test_returns_no_delegation_when_mkdir_fails_erofs(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Read-only cgroup mount (hardened cluster) → False."""
+        """EROFS on mkdir triggers NO_DELEGATION even when statvfs does not report ST_RDONLY."""
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
         real_mkdir = Path.mkdir
 
@@ -176,7 +192,7 @@ class TestDetect:
             real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
 
         monkeypatch.setattr(Path, "mkdir", rofs_mkdir)
-        assert detect_cgroup_kill_supported() is False
+        assert detect_cgroup_kill_supported() == (False, DETECT_REASON_NO_DELEGATION)
 
     def test_probe_cleans_up_after_itself(
         self,
@@ -185,23 +201,13 @@ class TestDetect:
     ) -> None:
         """A successful detect must rmdir its probe cgroup."""
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
-        assert detect_cgroup_kill_supported() is True
+        assert detect_cgroup_kill_supported() == (True, None)
         leftovers = [p for p in tmp_path.iterdir() if "bbot-detect-" in p.name]
         assert leftovers == [], f"detect left probe dirs behind: {leftovers}"
 
 
-# ---------------------------------------------------------------------------
-# recover_orphan_cgroups
-# ---------------------------------------------------------------------------
-
-
 class TestRecoverOrphanCgroups:
-    """Run at Queen startup to reclaim cgroups + processes from a crashed bee.
-
-    Without this, a `kill -9` of the bee mid-scan leaves stale cgroup dirs
-    plus possibly-still-alive scan descendants in the pod. Over time the
-    pod's cgroup tree accumulates dead state.
-    """
+    """Reclaims stale cgroup dirs left by a crashed bee on Queen startup."""
 
     def test_returns_zero_when_parent_missing(
         self,
@@ -234,7 +240,6 @@ class TestRecoverOrphanCgroups:
             (parent / f"scan_{sid}").mkdir()
 
         assert recover_orphan_cgroups() == 3
-        # cgroup.kill in each orphan must have been written
         for sid in ("aaa", "bbb", "ccc"):
             assert not (parent / f"scan_{sid}").exists()
 
@@ -258,15 +263,8 @@ class TestRecoverOrphanCgroups:
         assert (parent / "other_thing").exists()
 
 
-# ---------------------------------------------------------------------------
-# ScanCgroup — constructor / scan_id validation
-# ---------------------------------------------------------------------------
-
-
 class TestScanCgroupInit:
-    """scan_id is opaque from the wire — validate strictly even though the
-    hive currently always sends UUIDs. Defense in depth.
-    """
+    """scan_id validation — strict even though the hive always sends UUIDs (defense in depth)."""
 
     @pytest.mark.parametrize(
         "scan_id",
@@ -330,11 +328,6 @@ class TestScanCgroupInit:
         parent = _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
         sc = ScanCgroup("abc123")
         assert sc.env == {"BBOT_BEE_SCAN_CGROUP": str(parent / "scan_abc123")}
-
-
-# ---------------------------------------------------------------------------
-# ScanCgroup — lifecycle: create / populate / kill / cleanup
-# ---------------------------------------------------------------------------
 
 
 class TestScanCgroupCreate:
@@ -419,28 +412,18 @@ class TestScanCgroupKill:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """kill() after the cgroup is already gone must NOT raise — it is
-        called from multiple paths (force stop, failsafe, monitor cleanup)
-        any of which may run after the cgroup has been removed by another.
-        """
+        """kill() after the cgroup is gone must not raise — called from multiple paths that may run after removal."""
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
         sc = ScanCgroup("zeta")
-        # Never call create().
-        sc.kill()  # must not raise
-        # Also: kill on a populated-then-removed cgroup
+        sc.kill()
         sc2 = ScanCgroup("eta")
         sc2.create()
         sc2.cleanup()
-        sc2.kill()  # must not raise
+        sc2.kill()
 
 
 class TestScanCgroupWaitEmpty:
-    """wait_empty polls cgroup.procs until empty + reaps zombies each tick.
-
-    Without the reap call, the bee's own zombie children (the scan_process
-    parent) keep them listed in cgroup.procs even after SIGKILL — wait_empty
-    times out spuriously.
-    """
+    """wait_empty polls until empty, reaping zombies each tick to avoid spurious timeouts."""
 
     def test_returns_true_when_already_empty(
         self,
@@ -460,7 +443,9 @@ class TestScanCgroupWaitEmpty:
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
         sc = ScanCgroup("iota")
         sc.create()
+        # The kernel marks a cgroup populated via both cgroup.procs and cgroup.events.populated=1.
         (sc.path / "cgroup.procs").write_text("999\n")
+        _set_populated(sc.path, value=1)
 
         drainer = _drain_procs_after(sc.path, after_calls=2)
         monkeypatch.setattr(cgroup_module, "reap_zombies", drainer)
@@ -478,12 +463,14 @@ class TestScanCgroupWaitEmpty:
         sc = ScanCgroup("kappa")
         sc.create()
         (sc.path / "cgroup.procs").write_text("999\n")
+        _set_populated(sc.path, value=1)
         calls = {"n": 0}
 
         def fake_reap() -> None:
             calls["n"] += 1
             if calls["n"] >= 3:
                 (sc.path / "cgroup.procs").write_text("")
+                _set_populated(sc.path, value=0)
 
         monkeypatch.setattr(cgroup_module, "reap_zombies", fake_reap)
         sc.wait_empty(timeout_s=0.5)
@@ -499,6 +486,7 @@ class TestScanCgroupWaitEmpty:
         sc = ScanCgroup("lambda")
         sc.create()
         (sc.path / "cgroup.procs").write_text("999\n")
+        _set_populated(sc.path, value=1)
         monkeypatch.setattr(cgroup_module, "reap_zombies", lambda: None)
         assert sc.wait_empty(timeout_s=0.1) is False
 
@@ -525,11 +513,10 @@ class TestScanCgroupCleanup:
     ) -> None:
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
         sc = ScanCgroup("nu")
-        # never created
-        sc.cleanup()  # must not raise
+        sc.cleanup()
         sc.create()
         sc.cleanup()
-        sc.cleanup()  # second cleanup must also be a no-op
+        sc.cleanup()
 
     def test_cleanup_leaks_on_ebusy(
         self,
@@ -537,9 +524,7 @@ class TestScanCgroupCleanup:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Non-empty cgroup → log WARNING, do NOT raise, leak the directory.
-        The next bee startup will reclaim it via recover_orphan_cgroups.
-        """
+        """Non-empty cgroup → log WARNING, do not raise, leak the directory for the next bee startup to reclaim."""
         _install_fake_cgroup_root(monkeypatch, tmp_path, kernel_kill=True)
         sc = ScanCgroup("xi")
         sc.create()
@@ -552,22 +537,16 @@ class TestScanCgroupCleanup:
 
         monkeypatch.setattr(Path, "rmdir", busy_rmdir)
         with caplog.at_level("WARNING", logger="bbot_bee.cgroup"):
-            sc.cleanup()  # must not raise
+            sc.cleanup()
         assert any("xi" in rec.message for rec in caplog.records)
 
 
-# ---------------------------------------------------------------------------
-# reap_zombies — moved from drone.py; preserve behavior
-# ---------------------------------------------------------------------------
-
-
 class TestReapZombies:
-    """reap_zombies must remain a safe-anywhere idempotent helper, used by
-    both Drone._monitor_process and Queen._event_flush_loop."""
+    """reap_zombies must remain a safe-anywhere idempotent helper."""
 
     def test_no_children_is_noop(self) -> None:
         """Calling with no zombie children must not raise."""
-        reap_zombies()  # must not raise
+        reap_zombies()
 
     def test_can_be_called_repeatedly(self) -> None:
         """Idempotent — multiple consecutive calls."""
