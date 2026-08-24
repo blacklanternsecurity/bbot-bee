@@ -1,19 +1,11 @@
-"""Tests for drone cleanup on scan finish — Bug 4 regression.
-
-Bug 4: _drones.pop() executed AFTER channel.send(). If the send failed
-(hive down), the drone stayed in _drones forever, causing the bee to
-report phantom active scans in state_sync.
-
-The fix: pop BEFORE send. These tests verify the drone is always
-cleaned up regardless of send success/failure.
-"""
+"""Tests for drone cleanup on scan finish."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from swarm_common.models import ScanStatus
+from swarm_common.models import ScanInfo, ScanStatus
 
 from bbot_bee.config import BeeConfig
 from bbot_bee.queen import Queen
@@ -36,15 +28,13 @@ class TestDroneCleanupOnFinish:
     async def test_drone_removed_on_finished(self) -> None:
         """Drone is removed from _drones when scan reaches FINISHED."""
         queen = Queen(_make_config())
-        # Simulate a drone in tracking
         mock_drone = MagicMock()
         mock_drone.started_at = 1000.0
         mock_drone.finished_at = 1010.0
         queen._drones["scan-1"] = mock_drone
 
-        assert queen.available_capacity == 2  # 3 - 1
+        assert queen.available_capacity == 2
 
-        # Mock channel.send to succeed
         queen._channel = AsyncMock()
         queen._channel.send = AsyncMock()
 
@@ -54,22 +44,19 @@ class TestDroneCleanupOnFinish:
         assert queen.available_capacity == 3
 
     async def test_drone_removed_even_when_send_fails(self) -> None:
-        """Drone is removed from _drones even when channel.send raises."""
+        """Drone is removed from _drones even when channel.send raises — pop happens before send."""
         queen = Queen(_make_config())
         mock_drone = MagicMock()
         mock_drone.started_at = 1000.0
         mock_drone.finished_at = 1010.0
         queen._drones["scan-1"] = mock_drone
 
-        # Mock channel.send to FAIL
         queen._channel = AsyncMock()
         queen._channel.send = AsyncMock(side_effect=ConnectionError("hive down"))
 
-        # Should not raise — the pop happens before the send
         with pytest.raises(ConnectionError):
             await queen._handle_scan_status_change("scan-1", ScanStatus.FINISHED)
 
-        # Drone MUST be removed despite send failure
         assert "scan-1" not in queen._drones
         assert queen.available_capacity == 3
 
@@ -121,8 +108,6 @@ class TestDroneCleanupOnFinish:
 
     async def test_state_sync_accurate_after_failed_send(self) -> None:
         """State sync payload reflects cleaned-up drones even after send failure."""
-        from swarm_common.models import ScanInfo
-
         queen = Queen(_make_config())
         mock_drone_1 = MagicMock()
         mock_drone_1.started_at = 1000.0
@@ -142,7 +127,6 @@ class TestDroneCleanupOnFinish:
         with pytest.raises(ConnectionError):
             await queen._handle_scan_status_change("scan-1", ScanStatus.FINISHED)
 
-        # Build state_sync — should only show scan-2
         payload = queen._build_state_sync()
         assert "scan-1" not in payload.active_scans
         assert len(payload.active_scans) == 1

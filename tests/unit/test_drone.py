@@ -1,16 +1,10 @@
-"""Tests for bbot_bee.drone — Drone subprocess lifecycle manager.
-
-Drone manages one bbot scan running in a separate Python subprocess.
-Tests use mock subprocesses (inline Python scripts via -c) for speed.
-Real bbot integration is tested in test_scan_process.py and E2E tests.
-
-The autouse fixture in ``tests/conftest.py`` swaps ``ScanCgroup`` for
-``_FakeScanCgroup`` so tests don't touch ``/sys/fs/cgroup``.
-"""
+"""Tests for bbot_bee.drone."""
 
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import textwrap
 from unittest.mock import AsyncMock
 
@@ -19,11 +13,6 @@ from swarm_common.models import ScanInfo, ScanStatus, scan_status_code
 from bbot_bee.drone import Drone
 from tests.conftest import _FakeScanCgroup
 
-# ---------------------------------------------------------------------------
-# Mock subprocess scripts (inline Python via -c)
-# ---------------------------------------------------------------------------
-
-# Successful scan: emits statuses and an event, exits 0
 _MOCK_SUCCESS_SCRIPT = textwrap.dedent("""\
     import json, sys, time
     config = json.loads(sys.stdin.readline())
@@ -37,7 +26,6 @@ _MOCK_SUCCESS_SCRIPT = textwrap.dedent("""\
     sys.exit(0)
 """)
 
-# Crash script: exits with code 1 after partial output
 _MOCK_CRASH_SCRIPT = textwrap.dedent("""\
     import json, sys
     config = json.loads(sys.stdin.readline())
@@ -45,7 +33,6 @@ _MOCK_CRASH_SCRIPT = textwrap.dedent("""\
     sys.exit(1)
 """)
 
-# Slow script: runs until SIGTERM, then exits 2
 _MOCK_SLOW_SCRIPT = textwrap.dedent("""\
     import json, signal, sys, time
     config = json.loads(sys.stdin.readline())
@@ -64,7 +51,6 @@ _MOCK_SLOW_SCRIPT = textwrap.dedent("""\
     sys.exit(2)
 """)
 
-# Hang script: ignores SIGTERM, must be SIGKILL'd
 _MOCK_HANG_SCRIPT = textwrap.dedent("""\
     import json, signal, sys, time
     config = json.loads(sys.stdin.readline())
@@ -76,7 +62,6 @@ _MOCK_HANG_SCRIPT = textwrap.dedent("""\
         time.sleep(0.1)
 """)
 
-# Preset used for all mock tests (doesn't matter — mock scripts ignore it)
 _MOCK_PRESET = {"target": ["127.0.0.1"], "modules": []}
 
 
@@ -157,7 +142,6 @@ class TestDroneLifecycle:
         assert len(events) >= 1
         assert events[0]["type"] == "DNS_NAME"
         assert events[0]["data"] == "example.com"
-        # _type discriminator should be stripped before dispatch
         assert "_type" not in events[0]
 
     async def test_events_sent_counter(self) -> None:
@@ -215,7 +199,6 @@ class TestDroneLifecycle:
 
         colorized = [line for line in log_lines if "colorized bbot log" in line]
         assert len(colorized) == 1, f"Expected 1 colorized log line, got {colorized}"
-        # Should be stripped clean — no ANSI escape sequences
         assert colorized[0] == "[INFO] colorized bbot log"
         assert "\033" not in colorized[0]
 
@@ -281,6 +264,30 @@ class TestDroneCrash:
         assert drone.status == ScanStatus.FAILED
         assert drone.is_terminal
 
+    async def test_external_signal_kill_without_stop_sets_failed(self) -> None:
+        """A subprocess killed by signal with no stop in progress (e.g. OOM) → FAILED, not ABORTED."""
+        drone = Drone(
+            scan_id="scan-oom",
+            preset=_MOCK_PRESET,
+            on_event=AsyncMock(),
+            on_status_change=AsyncMock(),
+            on_log_line=AsyncMock(),
+            _subprocess_script=_MOCK_HANG_SCRIPT,
+        )
+        await drone.start()
+        for _ in range(50):
+            if drone.status == ScanStatus.RUNNING:
+                break
+            await asyncio.sleep(0.1)
+        assert drone.status == ScanStatus.RUNNING
+
+        # Simulate an external/OOM kill: SIGKILL the subprocess directly, without drone.stop().
+        assert drone._process is not None
+        os.kill(drone._process.pid, signal.SIGKILL)
+        await drone.wait()
+
+        assert drone.status == ScanStatus.FAILED
+
 
 class TestDroneStop:
     """Tests for stopping a drone (cooperative and forced)."""
@@ -302,7 +309,6 @@ class TestDroneStop:
             _subprocess_script=_MOCK_SLOW_SCRIPT,
         )
         await drone.start()
-        # Wait for scan to reach RUNNING
         for _ in range(50):
             if drone.status == ScanStatus.RUNNING:
                 break
@@ -324,7 +330,6 @@ class TestDroneStop:
             _subprocess_script=_MOCK_HANG_SCRIPT,
         )
         await drone.start()
-        # Wait for scan to reach RUNNING
         for _ in range(50):
             if drone.status == ScanStatus.RUNNING:
                 break
@@ -332,9 +337,28 @@ class TestDroneStop:
 
         await drone.stop(force=True)
         assert drone.is_terminal
-        # cgroup.kill must have been invoked at least once on the force path
         kill_calls = [e for e in _FakeScanCgroup.instances[0].events if e[0] == "kill"]
         assert len(kill_calls) >= 1, f"force stop must call cgroup.kill; events={_FakeScanCgroup.instances[0].events}"
+
+    async def test_force_stop_sets_aborted(self) -> None:
+        """stop(force=True) SIGKILLs the scan, but it's an intentional abort → ABORTED, not FAILED."""
+        drone = Drone(
+            scan_id="scan-force-abort",
+            preset=_MOCK_PRESET,
+            on_event=AsyncMock(),
+            on_status_change=AsyncMock(),
+            on_log_line=AsyncMock(),
+            _subprocess_script=_MOCK_HANG_SCRIPT,
+        )
+        await drone.start()
+        for _ in range(50):
+            if drone.status == ScanStatus.RUNNING:
+                break
+            await asyncio.sleep(0.1)
+        assert drone.status == ScanStatus.RUNNING
+
+        await drone.stop(force=True)
+        assert drone.status == ScanStatus.ABORTED
 
     async def test_stop_escalates_to_sigkill(self) -> None:
         """Cooperative stop should escalate to SIGKILL after timeout."""
@@ -344,7 +368,8 @@ class TestDroneStop:
             on_event=AsyncMock(),
             on_status_change=AsyncMock(),
             on_log_line=AsyncMock(),
-            graceful_stop_timeout_s=0.5,  # Very short timeout to test escalation
+            # Short timeout forces the SIGTERM → SIGKILL escalation path.
+            graceful_stop_timeout_s=0.5,
             _subprocess_script=_MOCK_HANG_SCRIPT,
         )
         await drone.start()
@@ -353,7 +378,7 @@ class TestDroneStop:
                 break
             await asyncio.sleep(0.1)
 
-        await drone.stop()  # Should SIGTERM, timeout, then SIGKILL
+        await drone.stop()
         assert drone.is_terminal
 
     async def test_stop_already_finished_is_noop(self) -> None:
@@ -383,25 +408,14 @@ class TestDroneStop:
             on_status_change=AsyncMock(),
             on_log_line=AsyncMock(),
         )
-        await drone.stop()  # Should not raise
+        await drone.stop()
 
 
 class TestDroneCgroupLifecycle:
-    """Pins the cgroup integration contract:
-
-    - start() creates the cgroup, then populates it with the subprocess PID
-      *before* the preset is written to stdin.
-    - The subprocess inherits ``BBOT_BEE_SCAN_CGROUP`` so it can self-enroll.
-    - The SIGKILL escalation path uses cgroup.kill (synchronous, no await).
-    - _monitor_process cleans up: kill → wait_empty → cleanup.
-    - Concurrent drones get isolated cgroups — one drone's kill cannot
-      touch another's procs.
-    """
+    """Tests pinning the cgroup integration contract across start, monitor cleanup, failsafe, and isolation."""
 
     async def test_start_creates_then_populates_cgroup(self) -> None:
-        """create() must run before populate(), and populate(pid) must use
-        the actual subprocess PID.
-        """
+        """create() must run before populate(), and populate(pid) must use the actual subprocess PID."""
         drone = Drone(
             scan_id="scan-cg-start",
             preset=_MOCK_PRESET,
@@ -414,16 +428,12 @@ class TestDroneCgroupLifecycle:
         cg = _FakeScanCgroup.instances[0]
         names = [e[0] for e in cg.events]
         assert names[:2] == ["create", "populate"], f"events={cg.events}"
-        # The populated PID must equal the spawned subprocess's PID.
         populate_event = next(e for e in cg.events if e[0] == "populate")
         assert populate_event[1] == drone._process.pid
         await drone.wait()
 
     async def test_monitor_kills_waits_and_cleans_up(self) -> None:
-        """After subprocess exit, the lifecycle hook in _monitor_process
-        must do kill → wait_empty → cleanup, in that order, to atomically
-        clear any escaped descendants and reclaim the cgroup directory.
-        """
+        """After subprocess exit, _monitor_process must do kill → wait_empty → cleanup in order."""
         drone = Drone(
             scan_id="scan-cg-monitor",
             preset=_MOCK_PRESET,
@@ -437,15 +447,10 @@ class TestDroneCgroupLifecycle:
 
         cg = _FakeScanCgroup.instances[0]
         names = [e[0] for e in cg.events]
-        # Strictly ordered: kill → wait_empty → cleanup, after the initial
-        # create → populate from start().
         assert names == ["create", "populate", "kill", "wait_empty", "cleanup"], f"events={cg.events}"
 
     async def test_failsafe_kills_cgroup_synchronously(self) -> None:
-        """The loop.call_later SIGKILL failsafe must fire cgroup.kill from
-        within a synchronous callback. Use a short graceful_stop_timeout_s
-        and a SIGTERM-ignoring subprocess to force the escalation path.
-        """
+        """The loop.call_later SIGKILL failsafe must fire cgroup.kill from within a synchronous callback."""
         drone = Drone(
             scan_id="scan-cg-failsafe",
             preset=_MOCK_PRESET,
@@ -461,18 +466,14 @@ class TestDroneCgroupLifecycle:
                 break
             await asyncio.sleep(0.1)
 
-        await drone.stop()  # cooperative → SIGTERM ignored → failsafe → cgroup.kill
+        await drone.stop()
         assert drone.is_terminal
         cg = _FakeScanCgroup.instances[0]
         kill_events = [e for e in cg.events if e[0] == "kill"]
         assert len(kill_events) >= 1, f"failsafe must invoke cgroup.kill; events={cg.events}"
 
     async def test_concurrent_drones_get_isolated_cgroups(self) -> None:
-        """Two drones must get independent ScanCgroup instances with
-        different paths — killing one must not appear in the other's
-        event log. This is the property the old cmdline-based filter
-        existed to provide; cgroup isolation makes it kernel-enforced.
-        """
+        """Two drones get independent ScanCgroups; killing one must not appear in the other's event log."""
         drone_a = Drone(
             scan_id="scan-iso-A",
             preset=_MOCK_PRESET,
@@ -498,16 +499,13 @@ class TestDroneCgroupLifecycle:
         assert "scan-iso-A" in str(cg_a.path)
         assert "scan-iso-B" in str(cg_b.path)
 
-        # Force-stop only drone A.
         await drone_a.stop(force=True)
 
-        # cg_a got kill events; cg_b has no kill events yet.
         a_kills = [e for e in cg_a.events if e[0] == "kill"]
         b_kills = [e for e in cg_b.events if e[0] == "kill"]
         assert len(a_kills) >= 1
         assert b_kills == [], f"drone A's kill must not touch drone B's cgroup; B events={cg_b.events}"
 
-        # Clean up drone B for hygiene.
         await drone_b.stop(force=True)
 
 

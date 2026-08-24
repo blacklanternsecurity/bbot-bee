@@ -1,14 +1,4 @@
-"""Queen — main agent that connects to the hive and manages drones.
-
-The Queen is the central process in the bbot_bee package. It:
-- Connects to the hive via WebSocket (3-layer reliable protocol)
-- Receives scan commands (start_scan, stop_scan) from the hive
-- Spawns Drone subprocesses for each scan
-- Buffers events and logs from drones, flushes in batches to the hive
-- Reports scan status changes immediately (CRITICAL priority)
-- Sends state_sync on connect/reconnect
-- Enforces max concurrent scan capacity
-"""
+"""Main bee agent — connects to the hive over WebSocket and manages Drone subprocesses."""
 
 from __future__ import annotations
 
@@ -17,6 +7,7 @@ from contextlib import suppress
 from functools import partial
 from logging import getLogger
 from typing import Any
+from uuid import uuid4
 
 from swarm_common.channel import MessagePriority, ReliableChannel
 from swarm_common.models import (
@@ -36,20 +27,59 @@ from bbot_bee.drone import Drone, reap_zombies
 
 log = getLogger(__name__)
 
-# How often to re-send state_sync while connected.  The hive's diagnostic
-# view of active scans (events_sent, started_at) freezes between state_sync
-# messages, so this directly drives freshness of the hive's /diagnostics
-# endpoint and the per-bee detail page in the UI.  Matches the UI's 10s
+# Hive's diagnostic view of active scans (events_sent, started_at) freezes
+# between state_sync messages, so this drives freshness of the hive's
+# /diagnostics endpoint and the per-bee detail page. Matches the UI's 10s
 # live-refresh cadence.
 STATE_SYNC_INTERVAL_S = 10.0
+# Maps reasons returned by ``cgroup.detect_cgroup_kill_supported`` to a
+# specific actionable fix line. Keeps the deployment-specific advice in one
+# place so operators see the exact flag for their environment instead of a
+# generic "needs writable cgroup" message.
+_CGROUP_FAILURE_FIXES = {
+    cgroup_module.DETECT_REASON_RO_CGROUPFS: (
+        "/sys/fs/cgroup is mounted read-only. "
+        "Docker 28.0+: add ``--security-opt writable-cgroups=true --cgroupns=private``. "
+        "Docker <28.0: add ``--privileged`` (broader, all-caps fallback). "
+        "Kubernetes: add ``securityContext.privileged: true`` (or "
+        "``capabilities.add: [SYS_ADMIN]`` + hostPath mount /sys/fs/cgroup)."
+    ),
+    cgroup_module.DETECT_REASON_NOT_CGROUP_V2: (
+        "/sys/fs/cgroup is not a cgroup v2 unified-hierarchy mount. "
+        "Switch the host to cgroup v2 (kernel 5.0+ with "
+        "``systemd.unified_cgroup_hierarchy=1``)."
+    ),
+    cgroup_module.DETECT_REASON_NO_DELEGATION: (
+        "Cannot create a child cgroup under /sys/fs/cgroup. "
+        "Bee process lacks write permission on the cgroup mount — check that "
+        "the container/pod was started with the correct cgroup delegation flags."
+    ),
+    cgroup_module.DETECT_REASON_KERNEL_TOO_OLD: (
+        "Kernel does not expose cgroup.kill (Linux 5.14+ required). "
+        "Upgrade the host kernel."
+    ),
+}
+
+
+def _format_cgroup_failure(reason: str | None) -> str:
+    """Build the user-facing RuntimeError message naming the actual fix.
+
+    Looks up `reason` in `_CGROUP_FAILURE_FIXES`; falls back to a generic
+    message if `reason` is None or unknown.
+    """
+    fix = _CGROUP_FAILURE_FIXES.get(
+        reason or "",
+        "cgroup v2 with cgroup.kill (Linux 5.14+) and writable delegation required.",
+    )
+    return f"Bee refusing to start: {fix}"
 
 
 class Queen:
-    """Main agent — connects to hive, manages drone subprocesses.
+    """Connects to the hive and manages drone subprocesses.
 
-    Receives commands from the hive, spawns Drone instances for each scan,
-    buffers events/logs, and reports status. Operates autonomously when the
-    hive connection drops (drones keep running, events buffer).
+    Receives commands, spawns Drone instances per scan, buffers events/logs, and
+    reports status. Operates autonomously when the hive connection drops —
+    drones keep running, events buffer.
     """
 
     def __init__(self, config: BeeConfig) -> None:
@@ -61,19 +91,19 @@ class Queen:
         Raises:
             RuntimeError: If cgroup v2 cgroup.kill is unavailable on this
                 host. The bee refuses to boot without the kernel termination
-                guarantee — no override.
+                guarantee — no override. Error message names the specific
+                deployment flag to add based on the detected failure mode.
         """
-        if not cgroup_module.detect_cgroup_kill_supported():
-            raise RuntimeError(
-                "cgroup v2 cgroup.kill is required but not available — bee "
-                "cannot start. Needs Linux 5.14+ with writable cgroup v2 "
-                "(K8s 1.25+ with cgroupns=private + systemd cgroup driver).",
-            )
+        ok, reason = cgroup_module.detect_cgroup_kill_supported()
+        if not ok:
+            raise RuntimeError(_format_cgroup_failure(reason))
         recovered = cgroup_module.recover_orphan_cgroups()
         if recovered:
-            log.warning(f"__init__: recovered {recovered=} orphan cgroups from previous bee")
+            log.warning(f"recovered {recovered=} orphan cgroups from previous bee")
 
         self._config = config
+        # Fresh per process — the hive reads a change as "this queen restarted".
+        self._boot_id = uuid4().hex
         self._connection = ConnectionManager(
             url=config.hive_url,
             api_key=config.api_key,
@@ -81,13 +111,11 @@ class Queen:
         )
         self._channel = ReliableChannel(self._connection)
 
-        # Drone management
         self._drones: dict[str, Drone] = {}
         self._init_max_scans = config.max_init_concurrent_scans
         self._max_concurrent_scans = config.max_init_concurrent_scans
         self._graceful_stop_timeout_s = config.graceful_stop_timeout_s
 
-        # Event/log buffers — keyed by scan_id
         self._event_buffer: dict[str, list[dict[str, Any]]] = {}
         self._log_buffer: dict[str, list[str]] = {}
 
@@ -104,41 +132,42 @@ class Queen:
 
         log.debug(f"Queen initialized: bee_id={self.bee_id}, hive_url={config.hive_url}")
 
-    # --- Properties -----------------------------------------------------------
-
     @property
     def bee_id(self) -> str:
         """The queen's unique identifier (used as bee_id in hive communication)."""
         return self._config.bee_id
 
     @property
+    def boot_id(self) -> str:
+        """Per-process nonce identifying this queen incarnation."""
+        return self._boot_id
+
+    @property
     def available_capacity(self) -> int:
         """Number of additional scans that can be started."""
         return self._max_concurrent_scans - len(self._drones)
 
-    # --- Main run loop --------------------------------------------------------
-
     async def run(self) -> None:
-        """Main entry point — connect to hive with auto-reconnect.
+        """Connect to the hive with auto-reconnect.
 
-        On disconnect the queen keeps drones running and buffers events.
-        It reconnects with exponential backoff (1s base, 60s cap, 0.25 jitter)
-        and sends a fresh state_sync on each reconnect.
+        On disconnect the queen keeps drones running and buffers events. Reconnects
+        with exponential backoff (1s base, 60s cap, 0.25 jitter) and sends a fresh
+        state_sync on each reconnect.
         """
-        log.debug(f"run: entry, bee_id={self.bee_id}, hive_url={self._config.hive_url}")
-        log.info(f"run: starting queen {self.bee_id}")
+        log.debug(f"entry, bee_id={self.bee_id}, hive_url={self._config.hive_url}")
+        log.info(f"starting queen {self.bee_id}")
 
         self._connection.on_connect = self._on_connect
 
         attempt = 0
         while True:
             self._connection.disconnected_event.clear()
-            log.log(5, f"run: reconnect loop iteration — {attempt=}")
+            log.log(5, f"reconnect loop iteration — {attempt=}")
 
             try:
-                log.info(f"run: connecting to hive at {self._config.hive_url}")
+                log.info(f"connecting to hive at {self._config.hive_url}")
                 await self._connection.connect()
-                log.log(5, "run: connection established, resetting attempt counter")
+                log.log(5, "connection established, resetting attempt counter")
                 attempt = 0
 
                 self._tasks = [
@@ -148,56 +177,49 @@ class Queen:
                     create_task(self._state_sync_loop(), name=f"queen-{self.bee_id}-state-sync"),
                     create_task(self._connection.run_heartbeat(), name=f"queen-{self.bee_id}-heartbeat"),
                 ]
-                log.log(5, f"run: background tasks created — {[t.get_name() for t in self._tasks]}")
-                log.info(f"run: {len(self._tasks)} background tasks started")
+                log.log(5, f"background tasks created — {[t.get_name() for t in self._tasks]}")
+                log.info(f"{len(self._tasks)} background tasks started")
 
                 # Wait until disconnected (set by _mark_disconnected in ResilientWebSocket)
                 await self._connection.disconnected_event.wait()
-                log.warning("run: disconnect detected, will reconnect")
+                log.warning("disconnect detected, will reconnect")
 
             except ConnectionError as exc:
-                log.warning(f"run: connection failed — {exc}")
+                log.warning(f"connection failed — {exc}")
             except Exception as exc:
-                log.error(f"run: unexpected error — {type(exc).__name__}: {exc}")
+                log.error(f"unexpected error — {type(exc).__name__}: {exc}")
 
-            # Cancel all background tasks before reconnecting
             active_tasks = [t for t in self._tasks if not t.done()]
             log.log(
                 5,
-                f"run: cancelling tasks — active={[t.get_name() for t in active_tasks]}, "
+                f"cancelling tasks — active={[t.get_name() for t in active_tasks]}, "
                 f"done={[t.get_name() for t in self._tasks if t.done()]}",
             )
-            log.debug(f"run: cancelling {len(active_tasks)} background tasks before reconnect")
+            log.debug(f"cancelling {len(active_tasks)} background tasks before reconnect")
             for task in self._tasks:
                 if not task.done():
-                    log.log(5, f"run: cancelling task {task.get_name()}")
+                    log.log(5, f"cancelling task {task.get_name()}")
                     task.cancel()
             for task in self._tasks:
                 if not task.done():
                     with suppress(CancelledError):
                         await task
-                    log.log(5, f"run: task {task.get_name()} cancelled and awaited")
+                    log.log(5, f"task {task.get_name()} cancelled and awaited")
             self._tasks.clear()
-            log.debug("run: background tasks cancelled and cleared")
+            log.debug("background tasks cancelled and cleared")
 
-            # Ensure disconnected state
             await self._connection.disconnect()
 
-            # Exponential backoff with jitter (delegated to ResilientWebSocket)
             sleep_time = self._connection.calc_backoff(attempt)
-            log.log(5, f"run: reconnect backoff — {attempt=}, sleep={sleep_time:.2f}s")
-            log.info(f"run: reconnecting in {sleep_time:.1f}s")
+            log.log(5, f"reconnect backoff — {attempt=}, sleep={sleep_time:.2f}s")
+            log.info(f"reconnecting in {sleep_time:.1f}s")
             await sleep(sleep_time)
             attempt += 1
 
-    # --- Connection callbacks -------------------------------------------------
-
     async def _on_connect(self) -> None:
         """Called when the WebSocket connection is established or re-established."""
-        log.info("_on_connect: connected to hive, sending state_sync")
+        log.info("connected to hive, sending state_sync")
         await self._send_state_sync()
-
-    # --- State sync -----------------------------------------------------------
 
     def _build_state_sync(self) -> StateSyncPayload:
         """Build a StateSyncPayload from the current queen state."""
@@ -213,15 +235,16 @@ class Queen:
                 "init_max_scans": self._init_max_scans,
                 "available": available,
             },
+            boot_id=self._boot_id,
         )
         scan_count = len(active_scans)
         log.log(
             5,
-            f"_build_state_sync: full payload — bee_id={self.bee_id}, status=ONLINE, "
+            f"full payload — bee_id={self.bee_id}, status=ONLINE, "
             f"active_scans={dict(active_scans)}, capacity={{max_scans: {max_scans}, available: {available}}}, "
             f"drone_ids={list(self._drones.keys())}",
         )
-        log.debug(f"_build_state_sync: {scan_count=}, {available=}/{max_scans}")
+        log.debug(f"{scan_count=}, {available=}/{max_scans}")
         return payload
 
     async def _send_state_sync(self) -> None:
@@ -229,7 +252,7 @@ class Queen:
         payload = self._build_state_sync()
         msg = make_message(MessageType.STATE_SYNC, payload.model_dump())
         await self._channel.send(msg, priority=MessagePriority.CRITICAL)
-        log.info(f"_send_state_sync: state_sync sent with {len(payload.active_scans)} active scans")
+        log.info(f"state_sync sent with {len(payload.active_scans)} active scans")
 
     async def _state_sync_loop(self) -> None:
         """Periodically re-send state_sync so the hive's view of active scans stays fresh.
@@ -242,20 +265,18 @@ class Queen:
         A final send on cancellation (disconnect) captures the latest counts
         so reconnect overlap doesn't lose the trailing update.
         """
-        log.info(f"_state_sync_loop: starting ({STATE_SYNC_INTERVAL_S=:.1f}s)")
+        log.info(f"starting ({STATE_SYNC_INTERVAL_S=:.1f}s)")
         while True:
             try:
                 await sleep(STATE_SYNC_INTERVAL_S)
                 await self._send_state_sync()
             except CancelledError:
-                log.debug("_state_sync_loop: cancelled, sending final state_sync")
+                log.debug("cancelled, sending final state_sync")
                 with suppress(Exception):
                     await self._send_state_sync()
                 break
             except Exception as exc:
-                log.error(f"_state_sync_loop: error: {type(exc).__name__}: {exc}")
-
-    # --- Drone management -----------------------------------------------------
+                log.error(f"error: {type(exc).__name__}: {exc}")
 
     async def start_scan(
         self,
@@ -276,17 +297,17 @@ class Queen:
             RuntimeError: If at maximum capacity.
             ValueError: If scan_id already exists.
         """
-        log.debug(f"start_scan: entry, {scan_id=}, {name=}, preset_keys={list(preset.keys())}")
-        log.info(f"start_scan: {scan_id=}, {name=}")
+        log.debug(f"entry, {scan_id=}, {name=}, preset_keys={list(preset.keys())}")
+        log.info(f"{scan_id=}, {name=}")
 
         if scan_id in self._drones:
-            log.error(f"start_scan: {scan_id=} already exists")
+            log.error(f"{scan_id=} already exists")
             raise ValueError(f"Scan already exists: {scan_id=}")
 
         if self.available_capacity <= 0:
             current = len(self._drones)
             max_scans = self._max_concurrent_scans
-            log.error(f"start_scan: at capacity ({current}/{max_scans})")
+            log.error(f"at capacity ({current}/{max_scans})")
             raise RuntimeError(f"At capacity: {current}/{max_scans} scans running")
 
         drone = Drone(
@@ -301,10 +322,10 @@ class Queen:
         )
         self._drones[scan_id] = drone
         remaining = self.available_capacity
-        log.debug(f"start_scan: {scan_id=} drone created, {remaining=} capacity")
+        log.debug(f"{scan_id=} drone created, {remaining=} capacity")
 
         await drone.start()
-        log.info(f"start_scan: {scan_id=} started successfully")
+        log.info(f"{scan_id=} started successfully")
 
     async def stop_scan(self, scan_id: str, force: bool = False) -> None:
         """Stop a running scan.
@@ -316,11 +337,11 @@ class Queen:
         Raises:
             KeyError: If scan_id is not tracked.
         """
-        log.debug(f"stop_scan: entry, {scan_id=}, {force=}, tracked={scan_id in self._drones}")
-        log.info(f"stop_scan: {scan_id=}, {force=}")
+        log.debug(f"entry, {scan_id=}, {force=}, tracked={scan_id in self._drones}")
+        log.info(f"{scan_id=}, {force=}")
 
         if scan_id not in self._drones:
-            log.warning(f"stop_scan: {scan_id=} not in tracking (may have already finished)")
+            log.warning(f"{scan_id=} not in tracking (may have already finished)")
             raise KeyError(f"Scan not found: {scan_id=}")
 
         drone = self._drones.get(scan_id)
@@ -331,53 +352,49 @@ class Queen:
         # _drones cleanup happens inside _handle_scan_status_change when the
         # drone transitions to a terminal state — no explicit pop needed here.
         remaining = self.available_capacity
-        log.info(f"stop_scan: {scan_id=} stopped, {remaining=} capacity")
+        log.info(f"{scan_id=} stopped, {remaining=} capacity")
 
     def _on_stop_done(self, scan_id: str, task: Task[None]) -> None:
-        """Done callback for fire-and-forget stop tasks spawned from the
-        message loop. Clears tracking and surfaces any exception.
-        """
+        """Done callback for fire-and-forget stop tasks: clears tracking and surfaces any exception."""
         self._pending_stops.pop(scan_id, None)
         if task.cancelled():
-            log.warning(f"_on_stop_done: stop task for {scan_id=} was cancelled")
+            log.warning(f"stop task for {scan_id=} was cancelled")
             return
         exc = task.exception()
         if exc is None:
-            log.debug(f"_on_stop_done: stop task for {scan_id=} completed")
+            log.debug(f"stop task for {scan_id=} completed")
             return
         if isinstance(exc, KeyError):
-            log.warning(f"_on_stop_done: {scan_id=} not found (may have already finished)")
+            log.warning(f"{scan_id=} not found (may have already finished)")
         else:
-            log.error(f"_on_stop_done: stop task for {scan_id=} raised: {type(exc).__name__}: {exc}")
+            log.error(f"stop task for {scan_id=} raised: {type(exc).__name__}: {exc}")
 
     async def stop_all(self) -> None:
         """Stop all running drones. Used during queen shutdown."""
         count = len(self._drones)
-        log.debug(f"stop_all: entry, drone_count={count}")
-        log.info(f"stop_all: stopping {count} drones")
+        log.debug(f"entry, drone_count={count}")
+        log.info(f"stopping {count} drones")
 
         scan_ids = list(self._drones.keys())
         for scan_id in scan_ids:
             try:
                 await self.stop_scan(scan_id)
             except Exception as exc:
-                log.error(f"stop_all: error stopping {scan_id=}: {type(exc).__name__}: {exc}")
+                log.error(f"error stopping {scan_id=}: {type(exc).__name__}: {exc}")
 
-        log.info("stop_all: all drones stopped")
+        log.info("all drones stopped")
 
     def active_scans_info(self) -> dict[str, ScanInfo]:
         """Return ScanInfo for all active drones (for state_sync)."""
-        log.debug(f"active_scans_info: entry, drone_count={len(self._drones)}")
+        log.debug(f"entry, drone_count={len(self._drones)}")
         info = {scan_id: drone.to_info() for scan_id, drone in self._drones.items()}
         count = len(info)
-        log.debug(f"active_scans_info: {count=} active drones")
+        log.debug(f"{count=} active drones")
         return info
-
-    # --- Message processing ---------------------------------------------------
 
     async def _message_loop(self) -> None:
         """Receive messages from the hive and dispatch commands."""
-        log.info(f"_message_loop: starting message receive loop for queen {self.bee_id}")
+        log.info(f"starting message receive loop for queen {self.bee_id}")
         while True:
             try:
                 msg = await self._channel.recv()
@@ -388,41 +405,41 @@ class Queen:
                 scan_id_hint = msg.payload.get("scan_id", "")
                 log.log(
                     5,
-                    f"_message_loop: received — type={msg_type.value}, msg_id={msg.msg_id}, "
+                    f"received — type={msg_type.value}, msg_id={msg.msg_id}, "
                     f"scan_id={scan_id_hint!r}, payload_keys={list(msg.payload.keys())}",
                 )
-                log.debug(f"_message_loop: received {msg_type=}, msg_id={msg.msg_id}")
+                log.debug(f"received {msg_type=}, msg_id={msg.msg_id}")
 
                 if msg_type == MessageType.COMMAND:
                     await self._handle_command(msg.payload)
                 else:
-                    log.warning(f"_message_loop: unexpected message type: {msg_type}")
+                    log.warning(f"unexpected message type: {msg_type}")
 
             except ConnectionError:
-                log.warning("_message_loop: connection lost, exiting receive loop")
+                log.warning("connection lost, exiting receive loop")
                 break
             except CancelledError:
-                log.debug("_message_loop: cancelled")
+                log.debug("cancelled")
                 break
             except Exception as exc:
-                log.error(f"_message_loop: unexpected error: {type(exc).__name__}: {exc}")
+                log.error(f"unexpected error: {type(exc).__name__}: {exc}")
 
-        log.info("_message_loop: message loop exited")
+        log.info("message loop exited")
 
     async def _handle_command(self, payload: dict[str, Any]) -> None:
         """Dispatch a command from the hive."""
         cmd = payload.get("cmd", "")
-        log.info(f"_handle_command: {cmd=}")
+        log.info(f"{cmd=}")
 
         if cmd == "start_scan":
             scan_id = payload.get("scan_id", "")
             preset = payload.get("preset", {})
             name = payload.get("name")
-            log.info(f"_handle_command: starting scan {scan_id=}, {name=}")
+            log.info(f"starting scan {scan_id=}, {name=}")
             try:
                 await self.start_scan(scan_id, preset, name)
             except (RuntimeError, ValueError) as exc:
-                log.error(f"_handle_command: failed to start scan: {exc}")
+                log.error(f"failed to start scan: {exc}")
                 # Report FAILED back to hive so it can re-dispatch or clean up
                 await self._handle_scan_status_change(scan_id, ScanStatus.FAILED)
 
@@ -433,7 +450,7 @@ class Queen:
             # (up to graceful_stop_timeout_s) does not block the message
             # loop from processing other commands.  The task also
             # survives message_loop cancellation on reconnect.
-            log.info(f"_handle_command: spawning stop task for {scan_id=}, {force=}")
+            log.info(f"spawning stop task for {scan_id=}, {force=}")
             stop_task = create_task(
                 self.stop_scan(scan_id, force=force),
                 name=f"queen-{self.bee_id}-stop-{scan_id}",
@@ -441,46 +458,54 @@ class Queen:
             self._pending_stops[scan_id] = stop_task
             stop_task.add_done_callback(partial(self._on_stop_done, scan_id))
 
-        elif cmd in ("kill_module", "set_log_level", "toggle_log_level", "scan_status", "scope_check", "scan_config"):
-            scan_id = payload.get("scan_id", "")
-            log.info(f"_handle_command: forwarding {cmd} to drone {scan_id=}")
-            if (drone := self._drones.get(scan_id)) is None:
-                log.warning(f"_handle_command: {scan_id=} not found for {cmd}")
-                return
-            try:
-                await drone.send_command(payload)
-            except RuntimeError as exc:
-                log.error(f"_handle_command: {cmd} failed for {scan_id=}: {exc}")
-
         elif cmd == "set_max_scans":
             new_max = int(payload["max_scans"])
             old = self._max_concurrent_scans
             self._max_concurrent_scans = new_max
-            log.info(f"_handle_command: max_concurrent_scans {old} -> {new_max}")
+            log.info(f"max_concurrent_scans {old} -> {new_max}")
             await self._send_state_sync()
 
         else:
-            log.warning(f"_handle_command: unknown command: {cmd=}")
-
-    # --- Scan callbacks -------------------------------------------------------
+            # Per-scan command for the drone. Unknowns are rejected by the subprocess
+            # via cmd_result; routing failures are turned into cmd_result here so the
+            # hive's send_command_and_wait resolves instead of hitting its timeout.
+            scan_id = payload.get("scan_id", "")
+            log.info(f"forwarding {cmd} to drone {scan_id=}")
+            error: str | None = None
+            error_code: str | None = None
+            if (drone := self._drones.get(scan_id)) is None:
+                error = f"scan {scan_id} not active on this bee"
+                error_code = "scan_not_active"
+                log.warning(error)
+            else:
+                try:
+                    await drone.send_command(payload)
+                    return
+                except RuntimeError as exc:
+                    error = f"{cmd} send failed: {exc}"
+                    error_code = "drone_send_failed"
+                    log.error(error)
+            await self._handle_cmd_result(scan_id, {
+                "cmd": cmd,
+                "request_id": payload.get("request_id"),
+                "success": False,
+                "error": error,
+                "error_code": error_code,
+            })
 
     async def _handle_scan_event(self, scan_id: str, event: dict[str, Any]) -> None:
         """Buffer a scan event for batch sending."""
-        log.debug(f"_handle_scan_event: {scan_id=}, type={event.get('type', '?')}")
+        log.debug(f"{scan_id=}, type={event.get('type', '?')}")
         if scan_id not in self._event_buffer:
             self._event_buffer[scan_id] = []
         self._event_buffer[scan_id].append(event)
         count = len(self._event_buffer[scan_id])
-        log.debug(f"_handle_scan_event: {scan_id=} buffered event ({count=})")
+        log.debug(f"{scan_id=} buffered event ({count=})")
 
     async def _handle_scan_status_change(self, scan_id: str, status: ScanStatus) -> None:
         """Send a scan status change to the hive immediately (critical priority)."""
-        log.info(f"_handle_scan_status_change: {scan_id=}, {status=}")
-        log.log(
-            5,
-            f"_handle_scan_status_change: enter — {scan_id=}, status={status.value}, "
-            f"_drones_before={list(self._drones.keys())}",
-        )
+        log.info(f"{scan_id=}, {status=}")
+        log.log(5, f"enter — {scan_id=}, status={status.value}, _drones_before={list(self._drones.keys())}")
         code = scan_status_code(status)
         payload: dict[str, object] = {
             "scan_id": scan_id,
@@ -496,7 +521,7 @@ class Queen:
             if drone.finished_at is not None:
                 payload["finished_at"] = drone.finished_at
 
-        log.log(5, f"_handle_scan_status_change: full payload={payload}")
+        log.log(5, f"full payload={payload}")
 
         # Remove drones BEFORE sending — the send may fail if the hive is
         # down, but the drone must be cleaned up regardless.  The channel
@@ -506,16 +531,19 @@ class Queen:
             remaining = self.available_capacity
             log.log(
                 5,
-                f"_handle_scan_status_change: {scan_id=} terminal ({status.value}), "
+                f"{scan_id=} terminal ({status.value}), "
                 f"popped from _drones, _drones_after={list(self._drones.keys())}, {remaining=}",
             )
-            log.info(
-                f"_handle_scan_status_change: {scan_id=} reached {status.value}, removed from tracking ({remaining=})"
-            )
+            log.info(f"{scan_id=} reached {status.value}, removed from tracking ({remaining=})")
+
+        # Flush events before terminal status so the hive sees them first.
+        if status.is_terminal:
+            await self._flush_events(self._config.event_batch_size)
+            await self._flush_logs(self._config.log_batch_size)
 
         msg = make_message(MessageType.SCAN_STATUS, payload)
         await self._channel.send(msg, priority=MessagePriority.CRITICAL)
-        log.debug(f"_handle_scan_status_change: {scan_id=} status sent")
+        log.debug(f"{scan_id=} status sent")
 
     async def _handle_scan_log_line(self, scan_id: str, line: str) -> None:
         """Buffer a scan log line for batch sending."""
@@ -523,24 +551,22 @@ class Queen:
             self._log_buffer[scan_id] = []
         self._log_buffer[scan_id].append(line)
         count = len(self._log_buffer[scan_id])
-        log.debug(f"_handle_scan_log_line: {scan_id=} buffered log line ({count=})")
+        log.debug(f"{scan_id=} buffered log line ({count=})")
 
     async def _handle_cmd_result(self, scan_id: str, data: dict[str, Any]) -> None:
         """Forward a command result from a drone subprocess to the hive."""
         cmd = data.get("cmd", "?")
         request_id = data.get("request_id", "")
-        log.info(f"_handle_cmd_result: {scan_id=}, {cmd=}, {request_id=}")
+        log.info(f"{scan_id=}, {cmd=}, {request_id=}")
         payload = {"scan_id": scan_id, **data}
         msg = make_message(MessageType.CMD_RESULT, payload)
         await self._channel.send(msg, priority=MessagePriority.CRITICAL)
-
-    # --- Flush loops ----------------------------------------------------------
 
     async def _event_flush_loop(self) -> None:
         """Periodically flush buffered events as event_batch messages."""
         interval = self._config.event_flush_interval_s
         batch_size = self._config.event_batch_size
-        log.info(f"_event_flush_loop: starting ({interval=:.1f}s, {batch_size=})")
+        log.info(f"starting ({interval=:.1f}s, {batch_size=})")
 
         while True:
             try:
@@ -548,28 +574,28 @@ class Queen:
                 await self._flush_events(batch_size)
                 reap_zombies()
             except CancelledError:
-                log.debug("_event_flush_loop: cancelled, flushing remaining events")
+                log.debug("cancelled, flushing remaining events")
                 await self._flush_events(batch_size)
                 break
             except Exception as exc:
-                log.error(f"_event_flush_loop: error: {type(exc).__name__}: {exc}")
+                log.error(f"error: {type(exc).__name__}: {exc}")
 
     async def _log_flush_loop(self) -> None:
         """Periodically flush buffered logs as log_batch messages."""
         interval = self._config.log_flush_interval_s
         batch_size = self._config.log_batch_size
-        log.info(f"_log_flush_loop: starting ({interval=:.1f}s, {batch_size=})")
+        log.info(f"starting ({interval=:.1f}s, {batch_size=})")
 
         while True:
             try:
                 await sleep(interval)
                 await self._flush_logs(batch_size)
             except CancelledError:
-                log.debug("_log_flush_loop: cancelled, flushing remaining logs")
+                log.debug("cancelled, flushing remaining logs")
                 await self._flush_logs(batch_size)
                 break
             except Exception as exc:
-                log.error(f"_log_flush_loop: error: {type(exc).__name__}: {exc}")
+                log.error(f"error: {type(exc).__name__}: {exc}")
 
     async def _flush_events(self, batch_size: int) -> None:
         """Flush all buffered events, sending in batches."""
@@ -582,12 +608,12 @@ class Queen:
                 try:
                     await self._channel.send(msg, priority=MessagePriority.NORMAL)
                     count = len(batch)
-                    log.debug(f"_flush_events: {scan_id=} flushed {count=} events")
+                    log.debug(f"{scan_id=} flushed {count=} events")
                 except ConnectionError:
                     remaining = batch + events
                     self._event_buffer[scan_id] = remaining
                     count = len(remaining)
-                    log.warning(f"_flush_events: connection lost, re-buffered {count=} events for {scan_id=}")
+                    log.warning(f"connection lost, re-buffered {count=} events for {scan_id=}")
                     break
 
     async def _flush_logs(self, batch_size: int) -> None:
@@ -601,47 +627,43 @@ class Queen:
                 try:
                     await self._channel.send(msg, priority=MessagePriority.NORMAL)
                     count = len(batch)
-                    log.debug(f"_flush_logs: {scan_id=} flushed {count=} lines")
+                    log.debug(f"{scan_id=} flushed {count=} lines")
                 except ConnectionError:
                     remaining = batch + logs
                     self._log_buffer[scan_id] = remaining
                     count = len(remaining)
-                    log.warning(f"_flush_logs: connection lost, re-buffered {count=} lines for {scan_id=}")
+                    log.warning(f"connection lost, re-buffered {count=} lines for {scan_id=}")
                     break
-
-    # --- Shutdown -------------------------------------------------------------
 
     async def shutdown(self) -> None:
         """Gracefully shut down the queen."""
-        log.debug(
-            f"shutdown: entry, bee_id={self.bee_id}, drone_count={len(self._drones)}, task_count={len(self._tasks)}",
-        )
-        log.info(f"shutdown: shutting down queen {self.bee_id}")
+        log.debug(f"entry, bee_id={self.bee_id}, drone_count={len(self._drones)}, task_count={len(self._tasks)}")
+        log.info(f"shutting down queen {self.bee_id}")
 
-        log.info("shutdown: stopping all drones")
+        log.info("stopping all drones")
         await self.stop_all()
 
         # Drain any fire-and-forget stop tasks kicked off via the hive
         # command channel (these run outside stop_all's await chain).
         pending = list(self._pending_stops.values())
         if pending:
-            log.info(f"shutdown: awaiting {len(pending)} in-flight stop task(s)")
+            log.info(f"awaiting {len(pending)} in-flight stop task(s)")
             await gather(*pending, return_exceptions=True)
 
-        log.info("shutdown: flushing remaining event/log buffers")
+        log.info("flushing remaining event/log buffers")
         try:
             await self._flush_events(self._config.event_batch_size)
             await self._flush_logs(self._config.log_batch_size)
         except Exception as exc:
-            log.warning(f"shutdown: error flushing buffers: {type(exc).__name__}: {exc}")
+            log.warning(f"error flushing buffers: {type(exc).__name__}: {exc}")
 
         for task in self._tasks:
             if not task.done():
                 task.cancel()
-        log.debug(f"shutdown: cancelled {len(self._tasks)} background tasks")
+        log.debug(f"cancelled {len(self._tasks)} background tasks")
 
         await self._connection.disconnect()
 
         with suppress(Exception):
             cgroup_module.recover_orphan_cgroups()
-        log.info(f"shutdown: queen {self.bee_id} shutdown complete")
+        log.info(f"queen {self.bee_id} shutdown complete")

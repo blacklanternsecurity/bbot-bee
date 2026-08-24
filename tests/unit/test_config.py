@@ -1,4 +1,4 @@
-"""Tests for bbot_bee.config — BeeConfig pydantic-settings model."""
+"""Tests for bbot_bee.config."""
 
 import pytest
 from pydantic import ValidationError
@@ -67,11 +67,13 @@ class TestBeeConfigCustom:
 
     def test_hive_url_required(self) -> None:
         """hive_url should be required."""
+        # type: ignore[call-arg] — intentionally omit hive_url to test validation
         with pytest.raises(ValidationError):
             BeeConfig(api_key="k")  # type: ignore[call-arg]
 
     def test_api_key_required(self) -> None:
         """api_key should be required."""
+        # type: ignore[call-arg] — intentionally omit api_key to test validation
         with pytest.raises(ValidationError):
             BeeConfig(hive_url="ws://localhost/ws")  # type: ignore[call-arg]
 
@@ -84,6 +86,7 @@ class TestBeeConfigEnvPrefix:
         monkeypatch.setenv("BBOT_BEE_HIVE_URL", "ws://env-hive/ws")
         monkeypatch.setenv("BBOT_BEE_API_KEY", "env-key")
         monkeypatch.setenv("BBOT_BEE_MAX_INIT_CONCURRENT_SCANS", "10")
+        # type: ignore[call-arg] — required fields come from monkeypatched env
         config = BeeConfig()  # type: ignore[call-arg]
         assert config.hive_url == "ws://env-hive/ws"
         assert config.api_key == "env-key"

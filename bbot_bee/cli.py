@@ -1,8 +1,4 @@
-"""CLI entry point for the bbot_bee agent.
-
-Usage:
-    bbot-bee --hive-url ws://hive:8100/drones/ws/my-drone --api-key <key>
-"""
+"""CLI entry point for the bbot_bee agent."""
 
 from __future__ import annotations
 
@@ -22,8 +18,9 @@ addLevelName(5, "TRACE")
 log = getLogger(__name__)
 
 
-def _build_parser() -> ArgumentParser:
-    """Build the argument parser for the CLI."""
+def main() -> None:
+    """Main entry point for the bbot-bee CLI."""
+
     parser = ArgumentParser(
         prog="bbot-bee",
         description="BBOT Drone — agent that wraps BBOT to execute distributed scans",
@@ -40,15 +37,12 @@ def _build_parser() -> ArgumentParser:
     parser.add_argument("--no-tls-verify", action="store_true", help="Disable TLS certificate verification")
     parser.add_argument(
         "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        choices=["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default=None,
         help="Log level (default: INFO)",
     )
-    return parser
+    args = parser.parse_args()
 
-
-def _build_config(args: Namespace) -> BeeConfig:
-    """Build a BeeConfig from CLI args + environment variables."""
     overrides: dict[str, str | int | bool] = {}
     if args.hive_url is not None:
         overrides["hive_url"] = args.hive_url
@@ -62,15 +56,7 @@ def _build_config(args: Namespace) -> BeeConfig:
         overrides["tls_verify"] = False
     if args.log_level is not None:
         overrides["log_level"] = args.log_level
-    return BeeConfig(**overrides)  # type: ignore[arg-type]
-
-
-def main() -> None:
-    """Main entry point for the bbot-bee CLI."""
-    parser = _build_parser()
-    args = parser.parse_args()
-
-    config = _build_config(args)
+    config = BeeConfig(**overrides)
 
     log_level = getLevelName(config.log_level)
     if not isinstance(log_level, int):
@@ -78,7 +64,7 @@ def main() -> None:
         log_level = int(config.log_level) if config.log_level.isdigit() else INFO
     basicConfig(
         level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s.%(funcName)s: %(message)s",
     )
     log.info(f"Starting bbot-bee {config.bee_id}")
     log.debug(f"Config: hive_url={config.hive_url}, max_init_scans={config.max_init_concurrent_scans}")

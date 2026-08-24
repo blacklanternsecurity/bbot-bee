@@ -1,14 +1,4 @@
-"""Shared test fixtures for bbot_bee.
-
-The ``_FakeScanCgroup`` autouse fixture replaces the real cgroup machinery
-across all unit tests so they don't try to mkdir under ``/sys/fs/cgroup``
-(which fails without root). ``detect_cgroup_kill_supported`` and
-``recover_orphan_cgroups`` are also stubbed to no-op so the bee boots in
-tests on hosts without a writable cgroup v2 tree.
-
-Tests that need to inspect cgroup interactions can access the recorded
-calls via ``_FakeScanCgroup.instances``.
-"""
+"""Shared test fixtures for bbot_bee."""
 
 from __future__ import annotations
 
@@ -22,14 +12,7 @@ import pytest
 
 
 class _FakeScanCgroup:
-    """In-memory fake of ``bbot_bee.cgroup.ScanCgroup``.
-
-    Records an ordered event log per instance so tests can pin the
-    lifecycle contract (``create`` → ``populate`` → ``kill`` →
-    ``wait_empty`` → ``cleanup``). ``kill()`` actually SIGKILL's any
-    populated PIDs so production code paths that wait on subprocess
-    exit still terminate in tests.
-    """
+    """In-memory fake of ``bbot_bee.cgroup.ScanCgroup`` that records an ordered event log per instance."""
 
     instances: list[_FakeScanCgroup] = []
 
@@ -72,9 +55,9 @@ class _FakeScanCgroup:
 
 @pytest.fixture(autouse=True)
 def _stub_cgroup(monkeypatch: pytest.MonkeyPatch) -> type[_FakeScanCgroup]:
-    """Replace ScanCgroup + detect/recover with no-op test doubles."""
+    """Replace ScanCgroup + detect/recover with no-op test doubles so tests don't touch /sys/fs/cgroup."""
     _FakeScanCgroup.reset()
     monkeypatch.setattr("bbot_bee.drone.ScanCgroup", _FakeScanCgroup)
-    monkeypatch.setattr("bbot_bee.cgroup.detect_cgroup_kill_supported", lambda: True)
+    monkeypatch.setattr("bbot_bee.cgroup.detect_cgroup_kill_supported", lambda: (True, None))
     monkeypatch.setattr("bbot_bee.cgroup.recover_orphan_cgroups", lambda: 0)
     return _FakeScanCgroup
