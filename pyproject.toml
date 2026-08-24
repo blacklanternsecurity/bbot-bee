@@ -29,8 +29,8 @@ dev = [
 ]
 
 [tool.uv.sources]
-bbot = { git = "https://github.com/blacklanternsecurity/bbot", rev = "dev" }
-bbot-swarm-common = { git = "ssh://git@github.com/blacklanternsecurity/bbot-swarm-common", rev = "scan-description" }
+bbot = { git = "https://github.com/blacklanternsecurity/bbot", tag = "v3.0.2" }
+bbot-swarm-common = { git = "https://github.com/blacklanternsecurity/bbot-swarm-common", rev = "7042a4b" }
 
 [tool.mypy]
 strict = true
